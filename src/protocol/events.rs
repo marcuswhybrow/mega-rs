@@ -64,6 +64,7 @@ pub struct NodeDeletedEventResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub struct UnknownEventResponse {
     #[serde(flatten)]
     pub other: HashMap<String, json::Value>,
