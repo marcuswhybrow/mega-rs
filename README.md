@@ -25,6 +25,9 @@
 About
 -----
 
+> [!NOTE]
+> This fork fixes the [original unmaintained repo](https://github.com/Hirevo/mega-rs) as of 2025-12-22.
+
 This is an (unofficial) API client library for interacting with MEGA's API using Rust.  
 
 This library aims to implement most (if not all) interactions with MEGA's API in pure Rust.  
