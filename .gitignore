@@ -14,3 +14,6 @@
 
 # ignored folder, used for testing purposes
 /ignored
+
+# Direnv automatic loading/unloading of environment
+.direnv
