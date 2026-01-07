@@ -1,6 +1,7 @@
 //! This is an API client library for interacting with MEGA's API using Rust.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, OnceLock};
 use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
@@ -12,9 +13,11 @@ use cipher::{BlockDecryptMut, BlockEncrypt, BlockEncryptMut, KeyInit, KeyIvInit,
 use futures::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use hmac::{Hmac, Mac};
 use pbkdf2::pbkdf2_hmac_array;
-use secrecy::{ExposeSecret, SecretBox};
+use rustc_hash::FxHashMap;
+use secrecy::{ExposeSecret, SecretBox, SecretSlice, SecretString};
 use sha2::{Sha256, Sha512};
 use static_assertions::assert_impl_all;
+use tracing::instrument;
 use url::Url;
 
 mod attributes;
@@ -27,7 +30,7 @@ mod utils;
 
 pub use crate::error::{Error, ErrorCode, Result};
 pub use crate::fingerprint::{compute_condensed_mac, compute_sparse_checksum};
-pub use crate::protocol::commands::{FileNode, NodeKind};
+pub use crate::protocol::commands::{FileNode, NodeType};
 pub use crate::sessions::SessionInfo;
 pub use crate::utils::StorageQuotas;
 
@@ -273,11 +276,12 @@ impl Client {
         };
 
         self.state.session = Some(SecretBox::new(Box::new(UserSession {
-            sid,
-            key,
+            session_id: sid,
+            master_key: key,
             sek,
             user_handle: response.u.clone(),
-            privk,
+            private_key: privk,
+            share_keys: None,
         })));
 
         Ok(())
@@ -344,11 +348,12 @@ impl Client {
         };
 
         self.state.session = Some(SecretBox::new(Box::new(UserSession {
-            sid,
-            key,
+            session_id: sid,
+            master_key: key,
             sek,
-            privk,
+            private_key: privk,
             user_handle: response.u.clone(),
+            share_keys: None,
         })));
 
         Ok(())
@@ -366,11 +371,11 @@ impl Client {
         let mut serialized: Vec<u8> = Vec::with_capacity(1 + USER_KEY_SIZE + USER_SID_SIZE);
         serialized.push(1);
 
-        let mut key = session.key;
+        let mut key = session.master_key;
         utils::encrypt_ebc_in_place(&session.sek, &mut key);
         serialized.extend(key);
 
-        let mut sid = BASE64_URL_SAFE_NO_PAD.decode(&session.sid)?;
+        let mut sid = BASE64_URL_SAFE_NO_PAD.decode(&session.session_id)?;
         serialized.append(&mut sid);
 
         Ok(BASE64_URL_SAFE_NO_PAD.encode(serialized))
@@ -515,6 +520,33 @@ impl Client {
         }
     }
 
+    pub(crate) async fn get_share_keys(&self) -> Result<HashMap::<String, Vec<u8>>> {
+        let session = self
+            .state
+            .session
+            .as_ref()
+            .ok_or(Error::MissingUserSession)?
+            .expose_secret();
+        let request = Request::UserAttributes {
+            user_handle: session.user_handle.clone().into(),
+            attribute: "^!keys".to_string(),
+            v: 1,
+        };
+        let responses = self.send_requests(&[request]).await?;
+
+        let attr = match responses.as_slice() {
+            [Response::UserAttributes(attr)] => attr,
+            [Response::Error(code)] => {
+                return Err(Error::from(*code));
+            }
+            _ => {
+                return Err(Error::InvalidResponseType);
+            }
+        };
+
+        Ok(utils::extract_share_keys(&session, attr)?)
+    }
+
     /// Fetches all nodes from the user's own MEGA account.
     pub async fn fetch_own_nodes(&self) -> Result<Nodes> {
         let session = self
@@ -524,26 +556,35 @@ impl Client {
             .ok_or(Error::MissingUserSession)?
             .expose_secret();
 
-        let request_1 = Request::FetchNodes { c: 1, r: None };
+        let request_1 = Request::FetchNodes { 
+            c: 1, 
+            // r: None,
+            r: Some(1),
+            cache: Some(1),
+            mc: None,
+            part: None,
+        };
         let request_2 = Request::UserAttributes {
             user_handle: session.user_handle.clone().into(),
             attribute: "^!keys".to_string(),
             v: 1,
         };
-        let responses = self.send_requests(&[request_1, request_2]).await?;
+        let mut responses = self.send_requests(&[request_1, request_2]).await?;
+        let mut responses = VecDeque::from(responses);
 
-        let (files, attr) = match responses.as_slice() {
-            [Response::FetchNodes(files), Response::UserAttributes(attr)] => (files, attr),
-            [Response::Error(code)] => {
-                return Err(Error::from(*code));
-            }
-            _ => {
-                return Err(Error::InvalidResponseType);
-            }
+        let (files, user_attributes) = match [responses.pop_front(), responses.pop_front()] {
+            [Some(Response::FetchNodes(files)), Some(Response::UserAttributes(user_attributes))] => (files, user_attributes),
+            [Some(Response::Error(code)), _] => { return Err(Error::from(code)); }
+            _ => { return Err(Error::InvalidResponseType); }
         };
 
-        let mut nodes = HashMap::<String, Node>::default();
-        let share_keys = utils::extract_share_keys(&session, attr)?;
+        let share_keys = utils::extract_share_keys(session, &user_attributes)?;
+
+        let decryption_context = Arc::new(session.decryption_context(share_keys, None));
+
+        let event_cursor = files.sn.clone();
+        let files = Arc::new(files.nodes);
+        let mut nodes = FxHashMap::<String, Node>::with_capacity_and_hasher(files.len(), Default::default());
 
         // This method of getting share keys seems to be unneeded.
         // (maybe an earlier implementation that got decommissionned/deprecated ?).
@@ -554,229 +595,159 @@ impl Client {
         //     share_keys.insert(share.handle.clone(), share_key);
         // }
 
-        for file in &files.nodes {
+        for file in files.iter() {
+            tracing::trace!("processing node");
             let (thumbnail_handle, preview_image_handle) = file
-                .file_attr
+                .file_attributes
                 .as_deref()
                 .map(|attr| utils::extract_attachments(attr))
                 .unwrap_or_default();
 
-            match file.kind {
-                NodeKind::File | NodeKind::Folder => {
+            match file.r#type {
+                NodeType::File | NodeType::Folder => {
+                    tracing::trace!("processing file or folder");
                     // if let Some((_, s_key)) = file.s_user.as_deref().zip(file.s_key.as_deref()) {
                     //     let mut share_key = BASE64_URL_SAFE_NO_PAD.decode(s_key)?;
                     //     utils::decrypt_ebc_in_place(&session.key, &mut share_key);
                     //     utils::decrypt_ebc_in_place(&share_key, &mut file_key);
                     //     share_keys.insert(file.handle.clone(), share_key.clone());
                     // }
-
-                    let Some(file_key) = file.key.as_deref() else {
+                    
+                    let Some(file_key) = file.key.clone() else {
                         continue;
                     };
 
-                    let Some(mut file_key) = file_key.split('/').find_map(|key| {
-                        let (file_user, file_key) = key.split_once(':')?;
+                    tracing::trace!("calculating children");
 
-                        if file_key.len() >= 44 {
-                            // Keys bigger than this size are using RSA instead of AES.
-                            let data = BASE64_URL_SAFE_NO_PAD.decode(file_key).ok()?;
-                            let (encrypted, _) = utils::rsa::get_mpi(&data).ok()?;
-                            let mut decrypted = session.privk.decrypt(encrypted);
-                            if file.kind.is_file() {
-                                decrypted.truncate(FILE_KEY_SIZE);
-                            } else {
-                                decrypted.truncate(FOLDER_KEY_SIZE);
-                            }
-                            return Some(decrypted);
-                        }
+                    // let children = nodes
+                    //     .values()
+                    //     .filter_map(|node| {
+                    //         let parent_handle = node.parent_handle()?;
+                    //         if parent_handle == &file.handle {
+                    //             Some(file.handle.clone())
+                    //         } else {
+                    //             None
+                    //         }
+                    //     })
+                    //     .collect();
 
-                        let mut file_key = BASE64_URL_SAFE_NO_PAD.decode(file_key).ok()?;
-
-                        // File keys are 32 bytes and folder keys are 16 bytes.
-                        // Other sizes are considered invalid.
-                        if (file.kind.is_file() && file_key.len() != FILE_KEY_SIZE)
-                            || (!file.kind.is_file() && file_key.len() != FOLDER_KEY_SIZE)
-                        {
-                            return None;
-                        }
-
-                        // TODO: MEGA includes in its web client a check to see if both halves of `file_key`
-                        //       are identical to each other. This is apparently done to prevent an attacker from
-                        //       being able to produce an all-zeroes AES key (by XOR-ing the two halves after EBC decryption).
-                        //       It's a bit unclear what we should do in our specific case, so it isn't yet implemented here.
-                        //
-                        //       Here would be how to implement such a check:
-                        //       ```
-                        //       if !self.state.allow_null_keys {
-                        //           let (fst, snd) = file_key.split_at(16);
-                        //           if fst == snd {
-                        //               return None;
-                        //           }
-                        //       }
-                        //       ```
-
-                        if file_user == session.user_handle {
-                            // regular owned file or folder
-                            utils::decrypt_ebc_in_place(&session.key, &mut file_key);
-                            return Some(file_key);
-                        }
-
-                        if let Some(share_key) = share_keys.get(file_user) {
-                            // shared file or folder
-                            utils::decrypt_ebc_in_place(&share_key, &mut file_key);
-                            return Some(file_key);
-                        }
-
-                        None
-                    }) else {
-                        continue;
-                    };
-
-                    let (aes_key, aes_iv, condensed_mac) = if file.kind.is_file() {
-                        utils::unmerge_key_mac(&mut file_key);
-
-                        let (aes_key, rest) = file_key.split_at(16);
-                        let (aes_iv, condensed_mac) = rest.split_at(8);
-
-                        (
-                            aes_key.try_into().unwrap(),
-                            aes_iv.try_into().ok(),
-                            condensed_mac.try_into().ok(),
-                        )
-                    } else {
-                        (file_key.try_into().unwrap(), None, None)
-                    };
-
-                    let attrs = {
-                        let mut buffer = BASE64_URL_SAFE_NO_PAD.decode(&file.attr)?;
-                        NodeAttributes::decrypt_and_unpack(&aes_key, buffer.as_mut_slice())?
-                    };
-
-                    let fingerprint = attrs.extract_fingerprint();
-
-                    let modified_at = (attrs.modified_at)
-                        .or_else(|| fingerprint.as_ref().map(|it| it.modified_at))
-                        .and_then(|timestamp| Utc.timestamp_opt(timestamp, 0).single());
+                    tracing::trace!("instantiating Node");
 
                     let node = Node {
-                        name: attrs.name,
+                        files: files.clone(),
                         handle: file.handle.clone(),
-                        owner: file.user.clone(),
-                        size: file.sz.unwrap_or(0),
-                        kind: file.kind,
-                        parent: (!file.parent.is_empty()).then(|| file.parent.clone()),
-                        children: nodes
-                            .values()
-                            .filter_map(|it| {
-                                let parent = it.parent.as_ref()?;
-                                (parent == &file.handle).then(|| file.handle.clone())
-                            })
-                            .collect(),
-                        aes_key,
-                        aes_iv,
-                        condensed_mac,
-                        sparse_checksum: fingerprint.map(|it| it.checksum),
-                        created_at: Some(Utc.timestamp_opt(file.ts, 0).unwrap()),
-                        modified_at,
+                        owner_user_handle: file.owner_user_handle.clone(),
+                        file_size: file.file_size.unwrap_or(0),
+                        r#type: file.r#type,
+                        parent_handle: (!file.parent_handle.is_empty()).then(|| file.parent_handle.clone()),
+                        children: OnceLock::new(),
+                        created_at: Some(Utc.timestamp_opt(file.actual_creation_timestamp, 0).unwrap()),
                         download_id: None,
                         thumbnail_handle,
                         preview_image_handle,
+                        decryption_context: Some(decryption_context.clone()),
+                        encrypted_data: Some(NodeEncrypedData {
+                            file_key,
+                            attributes: file.attributes.clone(),
+                        }),
+                        decrypted_data: OnceLock::new(),
                     };
 
-                    if let Some(parent) = nodes.get_mut(&file.parent) {
-                        parent.children.push(node.handle.clone());
-                    }
+                    tracing::trace!("inserting into parent");
+
+                    // if let Some(parent) = nodes.get_mut(&file.parent_handle) {
+                    //     parent.children.push(node.handle.clone());
+                    // }
+
+                    tracing::trace!("inserting into Nodes");
 
                     nodes.insert(node.handle.clone(), node);
                 }
-                NodeKind::Root => {
+                NodeType::Root => {
                     let node = Node {
-                        name: String::from("Root"),
+                        files: files.clone(),
                         handle: file.handle.clone(),
-                        owner: file.user.clone(),
-                        size: file.sz.unwrap_or(0),
-                        kind: NodeKind::Root,
-                        parent: None,
-                        children: nodes
-                            .values()
-                            .filter_map(|it| {
-                                let parent = it.parent.as_ref()?;
-                                (parent == &file.handle).then(|| file.handle.clone())
-                            })
-                            .collect(),
-                        aes_key: <_>::default(),
-                        aes_iv: None,
-                        condensed_mac: None,
-                        sparse_checksum: None,
-                        created_at: Some(Utc.timestamp_opt(file.ts, 0).unwrap()),
-                        modified_at: None,
+                        owner_user_handle: file.owner_user_handle.clone(),
+                        file_size: file.file_size.unwrap_or(0),
+                        r#type: NodeType::Root,
+                        parent_handle: None,
+                        children: OnceLock::new(),
+                        created_at: Some(Utc.timestamp_opt(file.actual_creation_timestamp, 0).unwrap()),
                         download_id: None,
                         thumbnail_handle,
                         preview_image_handle,
+                        decryption_context: None,
+                        encrypted_data: None,
+                        decrypted_data: OnceLock::from(Ok(NodeDecryptedData {
+                            name: String::from("Root"),
+                            aes_key: <_>::default(),
+                            aes_iv: None,
+                            condensed_mac: None,
+                            sparse_checksum: None,
+                            modified_at: None,
+                        })),
                     };
                     nodes.insert(node.handle.clone(), node);
                 }
-                NodeKind::Inbox => {
+                NodeType::Inbox => {
                     let node = Node {
-                        name: String::from("Inbox"),
+                        files: files.clone(),
                         handle: file.handle.clone(),
-                        owner: file.user.clone(),
-                        size: file.sz.unwrap_or(0),
-                        kind: NodeKind::Inbox,
-                        parent: None,
-                        children: nodes
-                            .values()
-                            .filter_map(|it| {
-                                let parent = it.parent.as_ref()?;
-                                (parent == &file.handle).then(|| file.handle.clone())
-                            })
-                            .collect(),
-                        aes_key: <_>::default(),
-                        aes_iv: None,
-                        condensed_mac: None,
-                        sparse_checksum: None,
-                        created_at: Some(Utc.timestamp_opt(file.ts, 0).unwrap()),
-                        modified_at: None,
+                        owner_user_handle: file.owner_user_handle.clone(),
+                        file_size: file.file_size.unwrap_or(0),
+                        r#type: NodeType::Inbox,
+                        parent_handle: None,
+                        children: OnceLock::new(),
+                        created_at: Some(Utc.timestamp_opt(file.actual_creation_timestamp, 0).unwrap()),
                         download_id: None,
                         thumbnail_handle,
                         preview_image_handle,
+                        decryption_context: None,
+                        encrypted_data: None,
+                        decrypted_data: OnceLock::from(Ok(NodeDecryptedData {
+                            name: String::from("Inbox"),
+                            aes_key: <_>::default(),
+                            aes_iv: None,
+                            condensed_mac: None,
+                            sparse_checksum: None,
+                            modified_at: None,
+                        })),
                     };
                     nodes.insert(node.handle.clone(), node);
                 }
-                NodeKind::Trash => {
+                NodeType::Trash => {
                     let node = Node {
-                        name: String::from("Trash"),
+                        files: files.clone(),
                         handle: file.handle.clone(),
-                        owner: file.user.clone(),
-                        size: file.sz.unwrap_or(0),
-                        kind: NodeKind::Trash,
-                        parent: None,
-                        children: nodes
-                            .values()
-                            .filter_map(|it| {
-                                let parent = it.parent.as_ref()?;
-                                (parent == &file.handle).then(|| file.handle.clone())
-                            })
-                            .collect(),
-                        aes_key: <_>::default(),
-                        aes_iv: None,
-                        condensed_mac: None,
-                        sparse_checksum: None,
-                        created_at: Some(Utc.timestamp_opt(file.ts, 0).unwrap()),
-                        modified_at: None,
+                        owner_user_handle: file.owner_user_handle.clone(),
+                        file_size: file.file_size.unwrap_or(0),
+                        r#type: NodeType::Trash,
+                        parent_handle: None,
+                        children: OnceLock::new(),
+                        created_at: Some(Utc.timestamp_opt(file.actual_creation_timestamp, 0).unwrap()),
                         download_id: None,
                         thumbnail_handle,
                         preview_image_handle,
+                        decryption_context: None,
+                        encrypted_data: None,
+                        decrypted_data: OnceLock::from(Ok(NodeDecryptedData {
+                            name: String::from("Trash"),
+                            aes_key: <_>::default(),
+                            aes_iv: None,
+                            condensed_mac: None,
+                            sparse_checksum: None,
+                            modified_at: None,
+                        })),
                     };
                     nodes.insert(node.handle.clone(), node);
                 }
-                NodeKind::Unknown => {
+                NodeType::Unknown => {
                     continue;
                 }
             }
         }
 
-        Ok(Nodes::new(nodes, files.sn.clone(), None))
+        Ok(Nodes::new(nodes, event_cursor, None))
     }
 
     /// Fetches all nodes from a public MEGA link.
@@ -794,8 +765,8 @@ impl Client {
         };
 
         let (node_kind, payload) = match payload.split_once("/") {
-            Some(("file", payload)) => (NodeKind::File, payload),
-            Some(("folder", payload)) => (NodeKind::Folder, payload),
+            Some(("file", payload)) => (NodeType::File, payload),
+            Some(("folder", payload)) => (NodeType::Folder, payload),
             _ => {
                 return Err(Error::InvalidPublicUrlFormat);
             }
@@ -810,10 +781,20 @@ impl Client {
             BASE64_URL_SAFE_NO_PAD.decode(key)?
         };
 
-        let mut nodes = HashMap::<String, Node>::default();
+
+        let session = self 
+            .state
+            .session
+            .as_ref()
+            .ok_or(Error::MissingUserSession)?
+            .expose_secret();
+
+        let decryption_context = Arc::new(session.decryption_context(HashMap::new(), Some(node_key.clone())));
 
         match node_kind {
-            NodeKind::File => {
+            NodeType::File => {
+                let mut nodes = FxHashMap::<String, Node>::with_capacity_and_hasher(1, Default::default());
+
                 let request = Request::Download {
                     g: 1,
                     ssl: 0,
@@ -872,156 +853,93 @@ impl Client {
                     .and_then(|timestamp| Utc.timestamp_opt(timestamp, 0).single());
 
                 let node = Node {
-                    name: attrs.name,
+                    files: Arc::new(vec![]),
                     handle: node_id.to_string(),
-                    owner: String::default(),
-                    size: file.size,
-                    kind: NodeKind::File,
-                    parent: None,
-                    children: Vec::default(),
-                    aes_key,
-                    aes_iv: Some(aes_iv),
-                    condensed_mac: Some(condensed_mac),
-                    sparse_checksum: fingerprint.map(|it| it.checksum),
+                    owner_user_handle: String::default(),
+                    file_size: file.size,
+                    r#type: NodeType::File,
+                    parent_handle: None,
+                    children: OnceLock::new(),
                     created_at: None,
-                    modified_at,
                     download_id: Some(node_id.to_string()),
                     thumbnail_handle: None,
                     preview_image_handle: None,
+                    decryption_context: None,
+                    encrypted_data: None,
+                    decrypted_data: OnceLock::from(Ok(NodeDecryptedData {
+                        name: attrs.name.unwrap_or_default(),
+                        aes_key,
+                        modified_at,
+                        aes_iv: Some(aes_iv),
+                        condensed_mac: Some(condensed_mac),
+                        sparse_checksum: fingerprint.map(|it| it.checksum),
+                    })),
                 };
 
                 nodes.insert(node.handle.clone(), node);
 
-                Ok(Nodes::new(
-                    nodes,
-                    String::default(),
-                    Some(node_id.to_string()),
-                ))
+                Ok(Nodes::new(nodes, String::default(), Some(node_id.to_string())))
             }
-            NodeKind::Folder => {
-                let request = Request::FetchNodes { c: 1, r: Some(1) };
-                let responses = self
+            NodeType::Folder => {
+
+                let request = Request::FetchNodes { 
+                    c: 1, 
+                    r: Some(1),
+                    cache: None,
+                    mc: None,
+                    part: None,
+                };
+                let mut responses = self
                     .client
                     .send_requests(&self.state, &[request], &[("n", node_id)])
                     .await?;
 
-                let files = match responses.as_slice() {
-                    [Response::FetchNodes(files)] => files,
-                    [Response::Error(code)] => {
-                        return Err(Error::from(*code));
+                let files = match responses.pop() {
+                    Some(Response::FetchNodes(files)) => files,
+                    Some(Response::Error(code)) => {
+                        return Err(Error::from(code));
                     }
                     _ => {
                         return Err(Error::InvalidResponseType);
                     }
                 };
 
-                for file in &files.nodes {
-                    match file.kind {
-                        NodeKind::File | NodeKind::Folder => {
-                            let Some(file_key) = file.key.as_deref() else {
+                let event_cursor = files.sn.clone();
+                let files = Arc::new(files.nodes);
+                let mut nodes = FxHashMap::<String, Node>::with_capacity_and_hasher(files.len(), Default::default());
+
+                for file in files.iter() {
+                    let (thumbnail_handle, preview_image_handle) = file
+                        .file_attributes
+                        .as_deref()
+                        .map(|attr| utils::extract_attachments(attr))
+                        .unwrap_or_default();
+
+                    match file.r#type {
+                        NodeType::File | NodeType::Folder => {
+                            let Some(file_key) = file.key.clone() else {
                                 continue;
                             };
-
-                            let Some(mut file_key) = file_key.split('/').find_map(|key| {
-                                let (_, file_key) = key.split_once(':')?;
-
-                                if file_key.len() >= 44 {
-                                    // Keys bigger than this size are using RSA instead of AES.
-                                    // We don't support this as of right now.
-                                    todo!();
-                                }
-
-                                let mut file_key = BASE64_URL_SAFE_NO_PAD.decode(file_key).ok()?;
-
-                                // File keys are 32 bytes and folder keys are 16 bytes.
-                                // Other sizes are considered invalid.
-                                if (file.kind.is_file() && file_key.len() != FILE_KEY_SIZE)
-                                    || (!file.kind.is_file() && file_key.len() != FOLDER_KEY_SIZE)
-                                {
-                                    return None;
-                                }
-
-                                // TODO: MEGA includes in its web client a check to see if both halves of `file_key`
-                                //       are identical to each other. This is apparently done to prevent an attacker from
-                                //       being able to produce an all-zeroes AES key (by XOR-ing the two halves after EBC decryption).
-                                //       It's a bit unclear what we should do in our specific case, so it isn't yet implemented here.
-                                //
-                                //       Here would be how to implement such a check:
-                                //       ```
-                                //       if !self.state.allow_null_keys {
-                                //           let (fst, snd) = file_key.split_at(16);
-                                //           if fst == snd {
-                                //               return None;
-                                //           }
-                                //       }
-                                //       ```
-
-                                utils::decrypt_ebc_in_place(&node_key, &mut file_key);
-                                Some(file_key)
-                            }) else {
-                                continue;
-                            };
-
-                            let (aes_key, aes_iv, condensed_mac) = if file.kind.is_file() {
-                                utils::unmerge_key_mac(&mut file_key);
-
-                                let (aes_key, rest) = file_key.split_at(16);
-                                let (aes_iv, condensed_mac) = rest.split_at(8);
-
-                                (
-                                    aes_key.try_into().unwrap(),
-                                    aes_iv.try_into().ok(),
-                                    condensed_mac.try_into().ok(),
-                                )
-                            } else {
-                                (file_key.try_into().unwrap(), None, None)
-                            };
-
-                            let attrs = {
-                                let mut buffer = BASE64_URL_SAFE_NO_PAD.decode(&file.attr)?;
-                                NodeAttributes::decrypt_and_unpack(&aes_key, buffer.as_mut_slice())?
-                            };
-
-                            let (thumbnail_handle, preview_image_handle) = file
-                                .file_attr
-                                .as_deref()
-                                .map(|attr| utils::extract_attachments(attr))
-                                .unwrap_or_default();
-
-                            let fingerprint = attrs.extract_fingerprint();
-
-                            let modified_at = (attrs.modified_at)
-                                .or_else(|| fingerprint.as_ref().map(|it| it.modified_at))
-                                .and_then(|timestamp| Utc.timestamp_opt(timestamp, 0).single());
 
                             let node = Node {
-                                name: attrs.name,
+                                files: files.clone(),
                                 handle: file.handle.clone(),
-                                owner: file.user.clone(),
-                                size: file.sz.unwrap_or(0),
-                                kind: file.kind,
-                                parent: (!file.parent.is_empty()).then(|| file.parent.clone()),
-                                children: nodes
-                                    .values()
-                                    .filter_map(|it| {
-                                        let parent = it.parent.as_ref()?;
-                                        (parent == &file.handle).then(|| file.handle.clone())
-                                    })
-                                    .collect(),
-                                aes_key,
-                                aes_iv,
-                                condensed_mac,
-                                sparse_checksum: fingerprint.map(|it| it.checksum),
-                                created_at: Some(Utc.timestamp_opt(file.ts, 0).unwrap()),
-                                modified_at,
+                                owner_user_handle: file.owner_user_handle.clone(),
+                                file_size: file.file_size.unwrap_or(0),
+                                r#type: file.r#type,
+                                parent_handle: (!file.parent_handle.is_empty()).then(|| file.parent_handle.clone()),
+                                children: OnceLock::new(),
+                                created_at: Some(Utc.timestamp_opt(file.actual_creation_timestamp, 0).unwrap()),
                                 download_id: Some(node_id.to_string()),
                                 thumbnail_handle,
                                 preview_image_handle,
+                                decryption_context: Some(decryption_context.clone()),
+                                encrypted_data: Some(NodeEncrypedData { 
+                                    file_key,
+                                    attributes: file.attributes.clone(),
+                                }),
+                                decrypted_data: OnceLock::new(),
                             };
-
-                            if let Some(parent) = nodes.get_mut(&file.parent) {
-                                parent.children.push(node.handle.clone());
-                            }
 
                             nodes.insert(node.handle.clone(), node);
                         }
@@ -1029,11 +947,7 @@ impl Client {
                     }
                 }
 
-                Ok(Nodes::new(
-                    nodes,
-                    files.sn.clone(),
-                    Some(node_id.to_string()),
-                ))
+                Ok(Nodes::new(nodes, event_cursor.clone(), Some(node_id.to_string())))
             }
             _ => unreachable!(),
         }
@@ -1133,7 +1047,7 @@ impl Client {
     /// Downloads a file into the given writer.
     pub async fn download_node<W: AsyncWrite>(&self, node: &Node, writer: W) -> Result<()> {
         let responses = if let Some(download_id) = node.download_id() {
-            let request = if node.handle.as_str() == download_id {
+            let request = if &node.handle == download_id {
                 Request::Download {
                     g: 1,
                     ssl: if self.state.https { 2 } else { 0 },
@@ -1176,14 +1090,14 @@ impl Client {
         let url =
             Url::parse(format!("{0}/{1}-{2}", response.download_url, 0, response.size).as_str())?;
 
-        let mut reader = self.client.get(url).await?.take(node.size);
+        let mut reader = self.client.get(url).await?.take(node.file_size());
 
         let mut file_iv = [0u8; 16];
 
-        file_iv[..8].copy_from_slice(node.aes_iv.unwrap_or_default().as_slice());
-        let mut ctr = ctr::Ctr128BE::<Aes128>::new(node.aes_key[..].into(), (&file_iv).into());
+        file_iv[..8].copy_from_slice(node.aes_iv()?.unwrap_or_default().as_slice());
+        let mut ctr = ctr::Ctr128BE::<Aes128>::new(node.aes_key()?[..].into(), (&file_iv).into());
 
-        file_iv[8..].copy_from_slice(node.aes_iv.unwrap_or_default().as_slice());
+        file_iv[8..].copy_from_slice(node.aes_iv()?.unwrap_or_default().as_slice());
 
         let (condensed_mac_reader, condensed_mac_writer) = sluice::pipe::pipe();
 
@@ -1223,9 +1137,9 @@ impl Client {
         };
 
         let condensed_mac_future = {
-            let size = node.size;
-            let aes_key = node.aes_key;
-            let aes_iv = node.aes_iv.unwrap();
+            let size = node.file_size();
+            let aes_key = node.aes_key()?;
+            let aes_iv = node.aes_iv()?.unwrap();
             async move {
                 fingerprint::compute_condensed_mac(condensed_mac_reader, size, &aes_key, &aes_iv)
                     .await
@@ -1234,7 +1148,7 @@ impl Client {
 
         let (_, condensed_mac) = futures::try_join!(download_future, condensed_mac_future)?;
 
-        if condensed_mac != node.condensed_mac.unwrap_or_default() {
+        if condensed_mac != node.condensed_mac()?.unwrap_or_default() {
             return Err(Error::CondensedMacMismatch);
         }
 
@@ -1356,7 +1270,7 @@ impl Client {
             let last_modified = last_modified.resolve().timestamp();
             let fingerprint = NodeFingerprint::new(sparse_checksum, last_modified);
             NodeAttributes {
-                name: name.to_string(),
+                name: Some(name.to_string()),
                 fingerprint: Some(fingerprint.serialize()),
                 modified_at: None,
                 other: HashMap::default(),
@@ -1374,12 +1288,12 @@ impl Client {
         key[24..].copy_from_slice(&condensed_mac);
         utils::merge_key_mac(&mut key);
 
-        utils::encrypt_ebc_in_place(&session.key, &mut key);
+        utils::encrypt_ebc_in_place(&session.master_key, &mut key);
 
         let key_b64 = BASE64_URL_SAFE_NO_PAD.encode(&key);
 
         let attrs = UploadAttributes {
-            kind: NodeKind::File,
+            kind: NodeType::File,
             key: key_b64,
             attr: file_attr_buffer,
             completion_handle,
@@ -1454,7 +1368,7 @@ impl Client {
             u32::from_le_bytes(len_bytes)
         };
 
-        let mut cbc = cbc::Decryptor::<Aes128>::new(node.aes_key[..].into(), (&[0u8; 16]).into());
+        let mut cbc = cbc::Decryptor::<Aes128>::new(node.aes_key()?[..].into(), (&[0u8; 16]).into());
 
         futures::pin_mut!(writer);
         let mut reader = reader.take(len.into());
@@ -1482,11 +1396,11 @@ impl Client {
 
     /// Downloads the node's thumbnail image into the given writer, if it exists.
     pub async fn download_thumbnail<W: AsyncWrite>(&self, node: &Node, writer: W) -> Result<()> {
-        let Some(attr_handle) = node.thumbnail_handle.as_deref() else {
+        let Some(ref attr_handle) = node.thumbnail_handle else {
             return Err(Error::NodeAttributeNotFound);
         };
 
-        self.download_attribute(AttributeKind::Thumbnail, attr_handle, node, writer)
+        self.download_attribute(AttributeKind::Thumbnail, &attr_handle, node, writer)
             .await
     }
 
@@ -1496,13 +1410,13 @@ impl Client {
         node: &Node,
         writer: W,
     ) -> Result<()> {
-        let Some(preview_image_handle) = node.preview_image_handle.as_deref() else {
+        let Some(ref preview_image_handle) = node.preview_image_handle else {
             return Err(Error::NodeAttributeNotFound);
         };
 
         self.download_attribute(
             AttributeKind::PreviewImage,
-            preview_image_handle,
+            &preview_image_handle,
             node,
             writer,
         )
@@ -1530,7 +1444,7 @@ impl Client {
             return Err(Error::InvalidResponseType);
         };
 
-        let mut cbc = cbc::Encryptor::<Aes128>::new(node.aes_key[..].into(), (&[0u8; 16]).into());
+        let mut cbc = cbc::Encryptor::<Aes128>::new(node.aes_key()?[..].into(), (&[0u8; 16]).into());
 
         let (pipe_reader, mut pipe_writer) = sluice::pipe::pipe();
 
@@ -1627,7 +1541,7 @@ impl Client {
         let mut aes_key: [u8; 16] = rand::random();
 
         let file_attr = NodeAttributes {
-            name: name.to_string(),
+            name: Some(name.to_string()),
             fingerprint: None,
             modified_at: None,
             other: HashMap::default(),
@@ -1638,12 +1552,12 @@ impl Client {
             BASE64_URL_SAFE_NO_PAD.encode(&buffer)
         };
 
-        utils::encrypt_ebc_in_place(&session.key, &mut aes_key);
+        utils::encrypt_ebc_in_place(&session.master_key, &mut aes_key);
 
         let key_b64 = BASE64_URL_SAFE_NO_PAD.encode(&aes_key);
 
         let attrs = UploadAttributes {
-            kind: NodeKind::Folder,
+            kind: NodeType::Folder,
             key: key_b64,
             attr: file_attr_buffer,
             completion_handle: String::from("xxxxxxxx"),
@@ -1677,12 +1591,12 @@ impl Client {
     pub async fn rename_node(&self, node: &Node, name: &str) -> Result<()> {
         let attributes = {
             let fingerprint =
-                (node.sparse_checksum.zip(node.modified_at)).map(|(checksum, modified_at)| {
+                (node.sparse_checksum()?.zip(node.modified_at()?)).map(|(checksum, modified_at)| {
                     NodeFingerprint::new(checksum, modified_at.timestamp()).serialize()
                 });
 
             NodeAttributes {
-                name: name.to_string(),
+                name: Some(name.to_string()),
                 fingerprint,
                 modified_at: None,
                 other: HashMap::default(),
@@ -1690,7 +1604,7 @@ impl Client {
         };
 
         let attributes_buffer = {
-            let buffer = attributes.pack_and_encrypt(&node.aes_key)?;
+            let buffer = attributes.pack_and_encrypt(node.aes_key()?)?;
             BASE64_URL_SAFE_NO_PAD.encode(&buffer)
         };
 
@@ -1776,7 +1690,7 @@ impl Client {
             qs.append_pair("sn", event_cursor);
 
             if let Some(session) = self.state.session.as_ref() {
-                qs.append_pair("sid", session.expose_secret().sid.as_str());
+                qs.append_pair("sid", session.expose_secret().session_id.as_str());
             }
 
             qs.finish();
@@ -1856,9 +1770,11 @@ impl Client {
                         continue;
                     };
 
+                    let decrypted_data = node.decrypted_data()?;
+
                     let attrs = {
                         let mut buffer = BASE64_URL_SAFE_NO_PAD.decode(&event.attr)?;
-                        NodeAttributes::decrypt_and_unpack(node.aes_key(), buffer.as_mut_slice())?
+                        NodeAttributes::decrypt_and_unpack(&decrypted_data.aes_key, buffer.as_mut_slice())?
                     };
 
                     let fingerprint = attrs.extract_fingerprint();
@@ -1869,7 +1785,7 @@ impl Client {
 
                     let attrs = EventNodeAttributes {
                         handle: event.handle,
-                        name: attrs.name,
+                        name: attrs.name.unwrap_or_default(),
                         owner: event.owner,
                         sparse_checksum: fingerprint.map(|it| it.checksum),
                         created_at: Some(Utc.timestamp_opt(event.ts, 0).unwrap()),
@@ -1945,7 +1861,7 @@ impl Client {
 
                     let attrs = {
                         let mut buffer = BASE64_URL_SAFE_NO_PAD.decode(&event.attr)?;
-                        NodeAttributes::decrypt_and_unpack(node.aes_key(), buffer.as_mut_slice())?
+                        NodeAttributes::decrypt_and_unpack(node.aes_key()?, buffer.as_mut_slice())?
                     };
 
                     let fingerprint = attrs.extract_fingerprint();
@@ -1956,7 +1872,7 @@ impl Client {
 
                     let attrs = EventNodeAttributes {
                         handle: event.handle,
-                        name: attrs.name,
+                        name: attrs.name.unwrap_or_default(),
                         owner: event.owner,
                         sparse_checksum: fingerprint.map(|it| it.checksum),
                         created_at: Some(Utc.timestamp_opt(event.ts, 0).unwrap()),
@@ -1984,19 +1900,15 @@ impl Client {
     }
 }
 
-fn construct_event_node(
-    session: &UserSession,
-    nodes: &Nodes,
-    file: FileNode,
-) -> Result<Option<EventNode>> {
+fn construct_event_node(session: &UserSession, nodes: &Nodes, file: FileNode) -> Result<Option<EventNode>> {
     let (thumbnail_handle, preview_image_handle) = file
-        .file_attr
+        .file_attributes
         .as_deref()
         .map(|attr| utils::extract_attachments(attr))
         .unwrap_or_default();
 
-    match file.kind {
-        NodeKind::File | NodeKind::Folder => {
+    match file.r#type {
+        NodeType::File | NodeType::Folder => {
             // if let Some((_, s_key)) = file.s_user.as_deref().zip(file.s_key.as_deref()) {
             //     let mut share_key = BASE64_URL_SAFE_NO_PAD.decode(s_key)?;
             //     utils::decrypt_ebc_in_place(&session.key, &mut share_key);
@@ -2015,23 +1927,23 @@ fn construct_event_node(
                     // Keys bigger than this size are using RSA instead of AES.
                     let data = BASE64_URL_SAFE_NO_PAD.decode(file_key).ok()?;
                     let (encrypted, _) = utils::rsa::get_mpi(&data).ok()?;
-                    let mut decrypted = session.privk.decrypt(encrypted);
-                    if file.kind.is_file() {
+                    let mut decrypted = session.private_key.decrypt(encrypted);
+                    if file.r#type.is_file() {
                         decrypted.truncate(FILE_KEY_SIZE);
                     } else {
                         decrypted.truncate(FOLDER_KEY_SIZE);
                     }
-                    return Some(decrypted);
+                    return Some(Ok(Some(decrypted)));
                 }
 
                 let mut file_key = BASE64_URL_SAFE_NO_PAD.decode(file_key).ok()?;
 
                 // File keys are 32 bytes and folder keys are 16 bytes.
                 // Other sizes are considered invalid.
-                if (file.kind.is_file() && file_key.len() != FILE_KEY_SIZE)
-                    || (!file.kind.is_file() && file_key.len() != FOLDER_KEY_SIZE)
+                if (file.r#type.is_file() && file_key.len() != FILE_KEY_SIZE)
+                    || (!file.r#type.is_file() && file_key.len() != FOLDER_KEY_SIZE)
                 {
-                    return None;
+                    return Some(Ok(None));
                 }
 
                 // TODO: MEGA includes in its web client a check to see if both halves of `file_key`
@@ -2050,14 +1962,20 @@ fn construct_event_node(
                 //       ```
 
                 if let Some(node_id) = nodes.download_id.as_deref() {
-                    let node = nodes.get_node_by_handle(node_id)?;
-                    utils::decrypt_ebc_in_place(node.aes_key(), &mut file_key);
-                    Some(file_key)
+                    let Some(node) = nodes.get_node_by_handle(node_id) else {
+                        return Some(Ok(None));
+                    };
+                    let decrypted_data = match node.decrypted_data() {
+                        Ok(decrypted_data) => decrypted_data,
+                        Err(e) => return Some(Err(e)),
+                    };
+                    utils::decrypt_ebc_in_place(&decrypted_data.aes_key, &mut file_key);
+                    Some(Ok(Some(file_key)))
                 } else {
                     if file_user == session.user_handle {
                         // regular owned file or folder
-                        utils::decrypt_ebc_in_place(&session.key, &mut file_key);
-                        return Some(file_key);
+                        utils::decrypt_ebc_in_place(&session.master_key, &mut file_key);
+                        return Some(Ok(Some(file_key)));
                     }
 
                     // if let Some(share_key) = share_keys.get(file_user) {
@@ -2066,13 +1984,13 @@ fn construct_event_node(
                     //     return Some(file_key);
                     // }
 
-                    None
+                    Some(Ok(None))
                 }
-            }) else {
+            }).transpose()?.flatten() else {
                 return Ok(None);
             };
 
-            let (aes_key, aes_iv, condensed_mac) = if file.kind.is_file() {
+            let (aes_key, aes_iv, condensed_mac) = if file.r#type.is_file() {
                 utils::unmerge_key_mac(&mut file_key);
 
                 let (aes_key, rest) = file_key.split_at(16);
@@ -2088,7 +2006,7 @@ fn construct_event_node(
             };
 
             let attrs = {
-                let mut buffer = BASE64_URL_SAFE_NO_PAD.decode(&file.attr)?;
+                let mut buffer = BASE64_URL_SAFE_NO_PAD.decode(&file.attributes)?;
                 NodeAttributes::decrypt_and_unpack(&aes_key, buffer.as_mut_slice())?
             };
 
@@ -2099,75 +2017,75 @@ fn construct_event_node(
                 .and_then(|timestamp| Utc.timestamp_opt(timestamp, 0).single());
 
             Ok(Some(EventNode {
-                name: attrs.name,
+                name: attrs.name.unwrap_or_default(),
                 handle: file.handle.clone(),
-                owner: file.user,
-                size: file.sz.unwrap_or(0),
-                kind: file.kind,
-                parent: (!file.parent.is_empty()).then(|| file.parent.clone()),
+                owner: file.owner_user_handle,
+                size: file.file_size.unwrap_or(0),
+                kind: file.r#type,
+                parent: (!file.parent_handle.is_empty()).then(|| file.parent_handle.clone()),
                 aes_key,
                 aes_iv,
                 condensed_mac,
                 checksum: fingerprint.map(|it| it.checksum),
-                created_at: Some(Utc.timestamp_opt(file.ts, 0).unwrap()),
+                created_at: Some(Utc.timestamp_opt(file.actual_creation_timestamp, 0).unwrap()),
                 modified_at,
                 download_id: nodes.download_id.clone(),
                 thumbnail_handle,
                 preview_image_handle,
             }))
         }
-        NodeKind::Root => Ok(Some(EventNode {
+        NodeType::Root => Ok(Some(EventNode {
             name: String::from("Root"),
             handle: file.handle.clone(),
-            owner: file.user,
-            size: file.sz.unwrap_or(0),
-            kind: NodeKind::Root,
+            owner: file.owner_user_handle,
+            size: file.file_size.unwrap_or(0),
+            kind: NodeType::Root,
             parent: None,
             aes_key: <_>::default(),
             aes_iv: None,
             condensed_mac: None,
             checksum: None,
-            created_at: Some(Utc.timestamp_opt(file.ts, 0).unwrap()),
+            created_at: Some(Utc.timestamp_opt(file.actual_creation_timestamp, 0).unwrap()),
             modified_at: None,
             download_id: nodes.download_id.clone(),
             thumbnail_handle,
             preview_image_handle,
         })),
-        NodeKind::Inbox => Ok(Some(EventNode {
+        NodeType::Inbox => Ok(Some(EventNode {
             name: String::from("Inbox"),
             handle: file.handle.clone(),
-            owner: file.user,
-            size: file.sz.unwrap_or(0),
-            kind: NodeKind::Inbox,
+            owner: file.owner_user_handle,
+            size: file.file_size.unwrap_or(0),
+            kind: NodeType::Inbox,
             parent: None,
             aes_key: <_>::default(),
             aes_iv: None,
             condensed_mac: None,
             checksum: None,
-            created_at: Some(Utc.timestamp_opt(file.ts, 0).unwrap()),
+            created_at: Some(Utc.timestamp_opt(file.actual_creation_timestamp, 0).unwrap()),
             modified_at: None,
             download_id: nodes.download_id.clone(),
             thumbnail_handle,
             preview_image_handle,
         })),
-        NodeKind::Trash => Ok(Some(EventNode {
+        NodeType::Trash => Ok(Some(EventNode {
             name: String::from("Trash"),
             handle: file.handle.clone(),
-            owner: file.user,
-            size: file.sz.unwrap_or(0),
-            kind: NodeKind::Trash,
+            owner: file.owner_user_handle,
+            size: file.file_size.unwrap_or(0),
+            kind: NodeType::Trash,
             parent: None,
             aes_key: <_>::default(),
             aes_iv: None,
             condensed_mac: None,
             checksum: None,
-            created_at: Some(Utc.timestamp_opt(file.ts, 0).unwrap()),
+            created_at: Some(Utc.timestamp_opt(file.actual_creation_timestamp, 0).unwrap()),
             modified_at: None,
             download_id: nodes.download_id.clone(),
             thumbnail_handle,
             preview_image_handle,
         })),
-        NodeKind::Unknown => Ok(None),
+        NodeType::Unknown => Ok(None),
     }
 }
 
@@ -2183,7 +2101,7 @@ pub struct EventNode {
     /// The size (in bytes) of the node.
     pub(crate) size: u64,
     /// The kind of the node.
-    pub(crate) kind: NodeKind,
+    pub(crate) kind: NodeType,
     /// The handle of the node's parent.
     pub(crate) parent: Option<String>,
     /// The AES key data of the node.
@@ -2228,7 +2146,7 @@ impl EventNode {
     }
 
     /// Returns the kind of the node.
-    pub fn kind(&self) -> NodeKind {
+    pub fn kind(&self) -> NodeType {
         self.kind
     }
 
@@ -2375,23 +2293,61 @@ impl EventBatch {
     }
 }
 
-/// Represents a node stored in MEGA (either a file or a folder).
-#[derive(Debug, PartialEq)]
+#[derive(Debug)]
 pub struct Node {
-    /// The name of the node.
-    pub(crate) name: String,
     /// The handle of the node.
     pub(crate) handle: String,
     /// The user handle of the owner of the node.
-    pub(crate) owner: String,
+    pub(crate) owner_user_handle: String,
     /// The size (in bytes) of the node.
-    pub(crate) size: u64,
+    pub(crate) file_size: u64,
     /// The kind of the node.
-    pub(crate) kind: NodeKind,
+    pub(crate) r#type: NodeType,
     /// The handle of the node's parent.
-    pub(crate) parent: Option<String>,
+    pub(crate) parent_handle: Option<String>,
     /// The handles of the node's children.
-    pub(crate) children: Vec<String>,
+    pub(crate) children: OnceLock<Vec<String>>,
+    /// The ID of the public link this node is from.
+    pub(crate) download_id: Option<String>,
+    /// The creation date of the node.
+    pub(crate) created_at: Option<DateTime<Utc>>,
+    /// The handle of the node's thumbnail.
+    pub(crate) thumbnail_handle: Option<String>,
+    /// The handle of the node's preview image.
+    pub(crate) preview_image_handle: Option<String>,
+
+    pub(crate) decryption_context: Option<Arc<DecryptionContext>>,
+    pub(crate) encrypted_data: Option<NodeEncrypedData>,
+    pub(crate) decrypted_data: OnceLock<Result<NodeDecryptedData>>,
+    pub(crate) files: Arc<Vec<FileNode>>,
+}
+
+impl PartialEq for Node {
+    fn eq(&self, other: &Self) -> bool {
+        self.handle == other.handle &&
+        self.owner_user_handle == other.owner_user_handle &&
+        self.file_size == other.file_size &&
+        self.r#type == other.r#type &&
+        self.parent_handle == other.parent_handle && 
+        self.children == other.children &&
+        self.download_id == other.download_id &&
+        self.created_at == other.created_at &&
+        self.thumbnail_handle == other.thumbnail_handle &&
+        self.preview_image_handle == other.preview_image_handle &&
+        self.encrypted_data.as_ref() == other.encrypted_data.as_ref()
+    }
+}
+
+#[derive(Debug, PartialEq)]
+pub struct NodeEncrypedData {
+    pub(crate) file_key: String,
+    pub(crate) attributes: String,
+}
+
+#[derive(Debug)]
+pub struct NodeDecryptedData {
+    /// The name of the node.
+    pub(crate) name: String,
     /// The AES key data of the node.
     pub(crate) aes_key: [u8; 16],
     /// The AES IV data of the node.
@@ -2400,87 +2356,230 @@ pub struct Node {
     pub(crate) condensed_mac: Option<[u8; 8]>,
     /// The sparse checksum of the node.
     pub(crate) sparse_checksum: Option<[u8; 16]>,
-    /// The creation date of the node.
-    pub(crate) created_at: Option<DateTime<Utc>>,
     /// The last modification date of the node.
     pub(crate) modified_at: Option<DateTime<Utc>>,
-    /// The ID of the public link this node is from.
-    pub(crate) download_id: Option<String>,
-    /// The handle of the node's thumbnail.
-    pub(crate) thumbnail_handle: Option<String>,
-    /// The handle of the node's preview image.
-    pub(crate) preview_image_handle: Option<String>,
 }
 
-impl Node {
-    /// Returns the name of the node.
+impl NodeDecryptedData {
     pub fn name(&self) -> &str {
         self.name.as_str()
     }
 
-    /// Returns the handle of the node.
-    pub fn handle(&self) -> &str {
-        self.handle.as_str()
+    pub fn modified_at(&self) -> Option<&DateTime<Utc>> {
+        self.modified_at.as_ref()
+    }
+}
+
+impl Node {
+    pub(crate) fn aes_key(&self) -> Result<&[u8; 16]> {
+        Ok(&self.decrypted_data()?.aes_key)
     }
 
-    /// Returns the user handle of the owner of the node.
-    pub fn owner(&self) -> &str {
-        self.owner.as_str()
+    pub(crate) fn aes_iv(&self) -> Result<&Option<[u8; 8]>> {
+        Ok(&self.decrypted_data()?.aes_iv)
     }
 
-    /// Returns the size (in bytes) of the node.
-    pub fn size(&self) -> u64 {
-        self.size
+    pub(crate) fn sparse_checksum(&self) -> Result<&Option<[u8; 16]>> {
+        Ok(&self.decrypted_data()?.sparse_checksum)
     }
 
-    /// Returns the kind of the node.
-    pub fn kind(&self) -> NodeKind {
-        self.kind
+    pub(crate) fn condensed_mac(&self) -> Result<&Option<[u8; 8]>> {
+        Ok(&self.decrypted_data()?.condensed_mac)
     }
 
-    /// Returns the handle of the node's parent.
-    pub fn parent(&self) -> Option<&str> {
-        self.parent.as_deref()
+    pub fn decrypted_data_mut(&mut self) -> Result<&mut NodeDecryptedData> {
+        _ = self.decrypted_data()?;
+        self.decrypted_data.get_mut().unwrap().as_mut().map_err(|e| e.clone())
     }
 
-    /// Returns the handles of the node's children.
-    pub fn children(&self) -> &[String] {
-        self.children.as_slice()
+    fn decrypted_data(&self) -> Result<&NodeDecryptedData> {
+        self.decrypted_data.get_or_init(|| {
+            let encrypted_data = self.encrypted_data
+                .as_ref()
+                .ok_or_else(|| crate::Error::NodeDecryptionFailureMissingEncryptedData)?;
+
+            let file_key_truncation_size = match self.r#type {
+                NodeType::Folder => FOLDER_KEY_SIZE,
+                NodeType::File => FILE_KEY_SIZE,
+                _ => { 
+                    return Err(crate::Error::NodeDecryptionFailureInvalidType {
+                        r#type: self.r#type(),
+                    }); 
+                },
+            };
+
+            let encrypted_file_key = encrypted_data.file_key.as_str();
+            let decryption_context = self.decryption_context
+                .clone()
+                .ok_or_else(|| crate::error::Error::NodeDecryptionFailureNoDecryptionContext)?;
+
+            let maybe_file_key = encrypted_file_key.split('/').find_map(|key| {
+                let (file_user, file_key) = key.split_once(':')?;
+
+                if file_key.len() >= 44 {
+                    // Keys bigger than this size are using RSA instead of AES.
+                    let data = BASE64_URL_SAFE_NO_PAD.decode(file_key).ok()?;
+                    let (encrypted, _) = utils::rsa::get_mpi(&data).ok()?;
+                    let user_private_key = decryption_context.user_private_key.expose_secret();
+                    let mut decrypted = user_private_key.decrypt(encrypted);
+                    decrypted.truncate(file_key_truncation_size);
+                    return Some(decrypted);
+                }
+
+                let mut file_key = BASE64_URL_SAFE_NO_PAD.decode(file_key).ok()?;
+
+                // File keys are 32 bytes and folder keys are 16 bytes.
+                // Other sizes are considered invalid.
+                if file_key.len() != file_key_truncation_size {
+                    return None;
+                }
+
+                // TODO: MEGA includes in its web client a check to see if both halves of `file_key`
+                //       are identical to each other. This is apparently done to prevent an attacker from
+                //       being able to produce an all-zeroes AES key (by XOR-ing the two halves after EBC decryption).
+                //       It's a bit unclear what we should do in our specific case, so it isn't yet implemented here.
+                //
+                //       Here would be how to implement such a check:
+                //       ```
+                //       if !self.state.allow_null_keys {
+                //           let (fst, snd) = file_key.split_at(16);
+                //           if fst == snd {
+                //               return None;
+                //           }
+                //       }
+                //       ```
+
+                if let Some(node_key) = &decryption_context.node_key {
+                    let node_key = node_key.expose_secret();
+                    let node_key = node_key.split_once('/').map_or(node_key, |it| it.0);
+                    let node_key = BASE64_URL_SAFE_NO_PAD.decode(node_key).ok()?;
+                    utils::decrypt_ebc_in_place(&node_key, &mut file_key);
+                    return Some(node_key.into());
+                }
+
+                if file_user == decryption_context.user_handle.expose_secret() {
+                    // regular owned file or folder
+                    let user_master_key = decryption_context.user_master_key.expose_secret();
+                    utils::decrypt_ebc_in_place(user_master_key, &mut file_key);
+                    return Some(file_key);
+                }
+
+                if let Some(share_key) = decryption_context.share_keys.get(file_user) {
+                    // shared file or folder
+                    utils::decrypt_ebc_in_place(share_key.expose_secret(), &mut file_key);
+                    return Some(file_key);
+                }
+
+                None
+            });
+
+            let Some(mut file_key) = maybe_file_key else {
+                return Err(crate::Error::NodeDecryptionFailureUnsupportedFileKey);
+            };
+
+            let (aes_key, aes_iv, condensed_mac) = if self.r#type.is_file() {
+                utils::unmerge_key_mac(&mut file_key);
+
+                let (aes_key, rest) = file_key.split_at(16);
+                let (aes_iv, condensed_mac) = rest.split_at(8);
+
+                (
+                    aes_key.try_into().unwrap(),
+                    aes_iv.try_into().ok(),
+                    condensed_mac.try_into().ok(),
+                )
+            } else {
+                (file_key.try_into().unwrap(), None, None)
+            };
+
+            let attrs = {
+                let Ok(mut buffer) = BASE64_URL_SAFE_NO_PAD.decode(&encrypted_data.attributes) else {
+                    return Err(crate::Error::NodeDecryptionFailureUndecodableAttributes);
+                };
+                let Ok(attrs) = NodeAttributes::decrypt_and_unpack(&aes_key, buffer.as_mut_slice()) else {
+                    return Err(crate::Error::NodeDecryptionFailureFailedToUnpackAttributes);
+                };
+                attrs
+            };
+
+            let maybe_fingerprint = attrs.extract_fingerprint();
+            let sparse_checksum = maybe_fingerprint.clone().map(|fingerprint| fingerprint.checksum);
+
+            let modified_at = (attrs.modified_at)
+                .or_else(|| maybe_fingerprint.as_ref().map(|fingerprint| fingerprint.modified_at))
+                .and_then(|timestamp| Utc.timestamp_opt(timestamp, 0).single());
+
+            Ok(NodeDecryptedData {
+                // The only node which doesn't provide it's name is the Password Manager node and
+                // perhaps one other similiar node representing a service.
+                // They present as folder type nodes with no name attribute.
+                name: attrs.name.unwrap_or_default(), 
+                aes_key,
+                aes_iv: aes_iv.into(), 
+                condensed_mac: condensed_mac.into(), 
+                sparse_checksum: sparse_checksum.into(), 
+                modified_at, 
+            })
+        })
+            .as_ref()
+            .map_err(|e| e.clone())
+    }
+
+    /// Returns the name of the node.
+    pub fn name(&self) -> Result<&str> {
+        Ok(self.decrypted_data()?.name.as_str())
     }
 
     /// Returns the last modified date of the node.
-    pub fn modified_at(&self) -> Option<DateTime<Utc>> {
-        self.modified_at
+    pub fn modified_at(&self) -> Result<Option<&DateTime<Utc>>> {
+        Ok(self.decrypted_data()?.modified_at.as_ref())
+    }
+
+    pub fn children(&self) -> &[String] {
+        self.children.get_or_init(|| {
+            self.files.iter().filter_map(|file_node| {
+                if file_node.parent_handle == self.handle {
+                    Some(file_node.handle.clone())
+                } else {
+                    None
+                }
+            }).collect()
+        })
+    }
+
+    pub fn children_mut(&mut self) -> &mut Vec<String> {
+        _ = self.children();
+        self.children.get_mut().unwrap()
+    }
+
+    /// Returns the user handle of the owner of the node.
+    pub fn owner_user_handle(&self) -> &str {
+        self.owner_user_handle.as_str()
+    }
+
+    /// Returns the size (in bytes) of the node.
+    pub fn file_size(&self) -> u64 {
+        self.file_size
+    }
+
+    /// Returns the kind of the node.
+    pub fn r#type(&self) -> NodeType {
+        self.r#type
+    }
+
+    /// Returns the handle of the node's parent.
+    pub fn parent_handle(&self) -> Option<&str> {
+        self.parent_handle.as_deref()
     }
 
     /// Returns the creation date of the node.
-    pub fn created_at(&self) -> Option<DateTime<Utc>> {
-        self.created_at
+    pub fn created_at(&self) -> Option<&DateTime<Utc>> {
+        self.created_at.as_ref()
     }
 
     /// Returns the ID of the public link this node is from.
     pub fn download_id(&self) -> Option<&str> {
         self.download_id.as_deref()
-    }
-
-    /// Returns the AES key data of the node.
-    pub fn aes_key(&self) -> &[u8; 16] {
-        &self.aes_key
-    }
-
-    /// Returns the AES IV data of the node.
-    pub fn aes_iv(&self) -> Option<&[u8; 8]> {
-        self.aes_iv.as_ref()
-    }
-
-    /// Returns the full-coverage condensed MAC signature of the node.
-    pub fn condensed_mac(&self) -> Option<&[u8; 8]> {
-        self.condensed_mac.as_ref()
-    }
-
-    /// Returns the sparse CRC32-based checksum of the node.
-    pub fn sparse_checksum(&self) -> Option<&[u8; 16]> {
-        self.sparse_checksum.as_ref()
     }
 
     /// Returns whether this node has a associated thumbnail.
@@ -2494,10 +2593,21 @@ impl Node {
     }
 }
 
+/// All the data required to decrypted a Node
+#[derive(Debug)]
+pub struct DecryptionContext {
+    pub(crate) user_handle: SecretString,
+    pub(crate) user_master_key: SecretSlice<u8>,
+    pub(crate) user_private_key: SecretBox<RsaPrivateKey>, 
+    pub(crate) share_keys: HashMap<String, SecretSlice<u8>>,
+    pub(crate) node_key: Option<SecretString>,
+}
+
 /// Represents a collection of nodes from MEGA.
+#[derive(Debug)]
 pub struct Nodes {
     /// The nodes from MEGA, keyed by their handle.
-    pub(crate) nodes: HashMap<String, Node>,
+    pub(crate) nodes: FxHashMap<String, Node>,
     /// The handle of the root node for the Cloud Drive.
     pub(crate) cloud_drive: Option<String>,
     /// The handle of the root node for the Rubbish Bin.
@@ -2514,19 +2624,19 @@ assert_impl_all!(Nodes: Send, Sync);
 
 impl Nodes {
     pub(crate) fn new(
-        nodes: HashMap<String, Node>,
+        nodes: FxHashMap<String, Node>,
         event_cursor: String,
         download_id: Option<String>,
     ) -> Self {
         let cloud_drive = nodes
             .values()
-            .find_map(|node| node.kind.is_root().then(|| node.handle.clone()));
+            .find_map(|node| node.r#type().is_root().then(|| node.handle.clone()));
         let rubbish_bin = nodes
             .values()
-            .find_map(|node| node.kind.is_rubbish_bin().then(|| node.handle.clone()));
+            .find_map(|node| node.r#type().is_rubbish_bin().then(|| node.handle.clone()));
         let inbox = nodes
             .values()
-            .find_map(|node| node.kind.is_inbox().then(|| node.handle.clone()));
+            .find_map(|node| node.r#type().is_inbox().then(|| node.handle.clone()));
 
         Self {
             nodes,
@@ -2546,11 +2656,11 @@ impl Nodes {
     /// Creates an iterator over all the root nodes.
     pub fn roots(&self) -> impl Iterator<Item = &Node> {
         self.nodes.values().filter(|node| {
-            node.parent.as_ref().map_or(true, |parent| {
+            node.parent_handle.as_ref().map_or(true, |parent_handle| {
                 // Root nodes from public links can still have
                 // a `parent` handle associated with them, but that
                 // parent won't be found in the current collection.
-                !self.nodes.contains_key(parent)
+                !self.nodes.contains_key(parent_handle)
             })
         })
     }
@@ -2561,19 +2671,45 @@ impl Nodes {
     }
 
     /// Gets a node, identified by its path.
-    pub fn get_node_by_path(&self, path: &str) -> Option<&Node> {
+    pub fn get_node_by_path(&self, path: &str) -> Result<Option<&Node>> {
         let path = path.strip_prefix('/').unwrap_or(path);
 
-        let Some((root, path)) = path.split_once('/') else {
-            return self.roots().find(|node| node.name == path);
+        let (root_name, path) = match path.split_once('/') {
+            Some((root_name, remainder)) => (root_name, remainder),
+            None => {
+                let maybe_root_node = self.roots().find_map(|node| match node.name() {
+                    Ok(name) if name == path => Some(Ok(node)),
+                    Ok(_) => None,
+                    Err(e) => Some(Err(e)),
+                }).transpose()?;
+                tracing::trace!(maybe_root_node = %maybe_root_node.map(|n| n.handle.clone()).unwrap_or_default(), "slash not found");
+                return Ok(maybe_root_node);
+            },
         };
 
-        let root = self.roots().find(|node| node.name == root)?;
-        path.split('/').fold(Some(root), |node, name| {
-            node?.children.iter().find_map(|handle| {
+        let maybe_root_node = self.roots().find_map(|node| match node.name() {
+            Ok(name) if name == root_name => Some(Ok(node)),
+            Ok(_) => None,
+            Err(e) => Some(Err(e)),
+        }).transpose()?;
+
+
+        let Some(root_node) = maybe_root_node else {
+            return Ok(None);
+        };
+
+        path.split('/').try_fold(Some(root_node), |node, name| {
+            let Some(node) = node else {
+                return Ok(None);
+            };
+            node.children().iter().find_map(move |handle| {
                 let found = self.get_node_by_handle(handle)?;
-                (found.name == name).then_some(found)
-            })
+                match found.name() {
+                    Ok(n) if n == name => Some(Ok(found)),
+                    Ok(_) => None,
+                    Err(e) => Some(Err(e)),
+                }
+            }).transpose()
         })
     }
 
@@ -2600,6 +2736,7 @@ impl Nodes {
         self.nodes.values()
     }
 
+    /// NOTE: ensure `decryption_pack` was created from this `Nodes` instance.
     pub fn apply_events(&mut self, events: EventBatch) -> Result<()> {
         if self.event_cursor != events.from {
             return Err(Error::EventCursorMismatch);
@@ -2633,36 +2770,41 @@ impl Nodes {
         let children = self
             .nodes
             .values()
-            .filter_map(|it| {
-                let parent = it.parent.as_ref()?;
-                (parent == &node.handle).then(|| node.handle.clone())
+            .filter_map(|node| {
+                let parent = node.parent_handle()?;
+                (parent == node.handle).then(|| node.handle.clone())
             })
-            .collect();
+            .collect::<Vec<_>>();
 
         let new_node = Node {
-            name: node.name,
+            files: Arc::new(vec![]),
             handle: node.handle,
-            owner: node.owner,
-            size: node.size,
-            kind: node.kind,
-            parent: node.parent,
-            children,
-            aes_key: node.aes_key,
-            aes_iv: node.aes_iv,
-            condensed_mac: node.condensed_mac,
-            sparse_checksum: node.checksum,
+            owner_user_handle: node.owner,
+            file_size: node.size,
+            r#type: node.kind,
+            parent_handle: node.parent,
+            children: OnceLock::from(children),
             created_at: node.created_at,
-            modified_at: node.modified_at,
             download_id: node.download_id,
             thumbnail_handle: node.thumbnail_handle,
+            encrypted_data: None,
+            decryption_context: None,
             preview_image_handle: node.preview_image_handle,
+            decrypted_data: OnceLock::from(Ok(NodeDecryptedData {
+                name: node.name,
+                aes_key: node.aes_key,
+                aes_iv: node.aes_iv,
+                condensed_mac: node.condensed_mac,
+                sparse_checksum: node.checksum,
+                modified_at: node.modified_at,
+            })),
         };
 
         // Add this node to its parent's children.
-        if let Some(parent_handle) = new_node.parent() {
+        if let Some(parent_handle) = new_node.parent_handle() {
             if let Some(parent_node) = self.nodes.get_mut(parent_handle) {
-                if !parent_node.children.contains(&new_node.handle) {
-                    parent_node.children.push(new_node.handle.clone());
+                if !parent_node.children_mut().contains(&new_node.handle) {
+                    parent_node.children_mut().push(new_node.handle.clone());
                 }
             }
         }
@@ -2671,15 +2813,15 @@ impl Nodes {
 
         // Remove this node from its old parent's children.
         if let Some(old_node) = maybe_old_node {
-            if let Some(parent_handle) = old_node.parent() {
+            if let Some(parent_handle) = old_node.parent_handle() {
                 if let Some(parent_node) = self.nodes.get_mut(parent_handle) {
                     let maybe_position = parent_node
-                        .children
+                        .children()
                         .iter()
-                        .position(|it| it == &old_node.handle);
+                        .position(|child_handle| child_handle == &old_node.handle);
 
                     if let Some(position) = maybe_position {
-                        parent_node.children.remove(position);
+                        parent_node.children_mut().remove(position);
                     }
                 }
             }
@@ -2687,15 +2829,15 @@ impl Nodes {
     }
 
     pub(crate) fn update_node_attributes(&mut self, attrs: EventNodeAttributes) {
-        let Some(node) = self.nodes.get_mut(&attrs.handle) else {
-            return;
-        };
+        let node = self.nodes.get_mut(&attrs.handle).expect("node should exists for handle");
 
-        node.name = attrs.name;
-        node.owner = attrs.owner;
-        node.sparse_checksum = attrs.sparse_checksum;
+        node.owner_user_handle = attrs.owner;
         node.created_at = attrs.created_at;
-        node.modified_at = attrs.modified_at;
+
+        let decrypted_data = node.decrypted_data_mut().expect("node should be decryptable");
+        decrypted_data.modified_at = attrs.modified_at;
+        decrypted_data.name = attrs.name;
+        decrypted_data.sparse_checksum = attrs.sparse_checksum;
     }
 
     pub(crate) fn delete_node(&mut self, handle: &str) {
@@ -2703,19 +2845,19 @@ impl Nodes {
             return;
         };
 
-        for handle in node.children {
+        for handle in node.children() {
             self.delete_node(handle.as_str());
         }
 
-        if let Some(parent_handle) = node.parent {
-            if let Some(parent_node) = self.nodes.get_mut(&parent_handle) {
+        if let Some(parent_handle) = node.parent_handle() {
+            if let Some(parent_node) = self.nodes.get_mut(&parent_handle.to_string()) {
                 let maybe_position = parent_node
-                    .children
+                    .children()
                     .iter()
-                    .position(|it| it == &node.handle);
+                    .position(|child_handle| child_handle == &node.handle);
 
                 if let Some(position) = maybe_position {
-                    parent_node.children.remove(position);
+                    parent_node.children_mut().remove(position);
                 }
             }
         }

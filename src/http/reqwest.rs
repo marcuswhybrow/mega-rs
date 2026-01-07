@@ -37,7 +37,7 @@ impl HttpClient for reqwest::Client {
             qs.append_pair("id", id_counter.to_string().as_str());
 
             if let Some(session) = state.session.as_ref() {
-                qs.append_pair("sid", session.expose_secret().sid.as_str());
+                qs.append_pair("sid", session.expose_secret().session_id.as_str());
             }
 
             qs.extend_pairs(query_params);
@@ -76,6 +76,9 @@ impl HttpClient for reqwest::Client {
                 hashcash_challenge = None;
             }
 
+            let body = json::to_string(&requests).unwrap();
+            tracing::info!(json = %body, "Sending request");
+
             let request_fut = builder.json(requests).send();
 
             let response = match if let Some(timeout) = state.timeout {
@@ -93,6 +96,8 @@ impl HttpClient for reqwest::Client {
                     continue;
                 }
             };
+
+            let status = response.status().to_string();
 
             // ─────────────────────────────────────────────────────────────────────
             // 409 = Payment‑Required → the server is challenging us with Hashcash
@@ -118,7 +123,12 @@ impl HttpClient for reqwest::Client {
             // The response did not ask for Hashcash – handle as usual
             // ─────────────────────────────────────────────────────────────────────
             let response_bytes = match response.error_for_status() {
-                Ok(ok) => ok.bytes().await?,
+                Ok(ok) => {
+                    let bytes = ok.bytes().await?;
+                    let body = String::from_utf8_lossy(&bytes);
+                    tracing::info!(status = %status, body = %body, "Response");
+                    bytes
+                },
                 Err(err) => {
                     tracing::error!(%err, "HTTP error status, will retry");
                     continue;
@@ -127,6 +137,7 @@ impl HttpClient for reqwest::Client {
 
             if let Ok(code) = json::from_slice::<ErrorCode>(&response_bytes) {
                 if code == ErrorCode::EAGAIN {
+                    tracing::debug!(?code, "MEGA returned error code EAGAIN (request failed but may be retried)");
                     continue;
                 }
                 if code != ErrorCode::OK {

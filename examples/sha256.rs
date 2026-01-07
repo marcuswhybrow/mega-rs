@@ -16,12 +16,12 @@ async fn run(mega: &mut mega::Client, distant_file_path: &str) -> mega::Result<(
     let nodes = mega.fetch_own_nodes().await?;
 
     let node = nodes
-        .get_node_by_path(distant_file_path)
+        .get_node_by_path(distant_file_path)?
         .expect("could not find node by path");
 
     let (reader, writer) = sluice::pipe::pipe();
 
-    let bar = ProgressBar::new(node.size());
+    let bar = ProgressBar::new(node.file_size());
     bar.set_style(progress_bar_style());
     bar.set_message(format!("hashing {0}...", node.name()));
 

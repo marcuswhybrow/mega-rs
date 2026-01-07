@@ -59,6 +59,7 @@ tokio-util = { version = "0.7.12", features = [
 # Logging
 tracing = "0.1.40"
 secrecy = { version = "0.10.2", features = ["serde"] }
+rustc-hash = "2.1.1"
 
 [features]
 default = ["reqwest"]

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::fmt::Display;
 
 use json::Value;
 use secrecy::{ExposeSecret, SecretString};
@@ -11,7 +12,7 @@ use crate::error::{ErrorCode, Result};
 /// Represents the kind of a given node.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize_repr, Deserialize_repr)]
-pub enum NodeKind {
+pub enum NodeType {
     /// A regular file.
     File = 0,
     /// A regular folder.
@@ -27,30 +28,44 @@ pub enum NodeKind {
     Unknown = u8::MAX,
 }
 
-impl NodeKind {
+impl NodeType {
     /// Returns whether the node is a regular file.
     pub fn is_file(self) -> bool {
-        matches!(self, NodeKind::File)
+        matches!(self, NodeType::File)
     }
 
     /// Returns whether the node is a regular folder.
     pub fn is_folder(self) -> bool {
-        matches!(self, NodeKind::Folder)
+        matches!(self, NodeType::Folder)
     }
 
     /// Returns whether the node is specifically the Cloud Drive root.
     pub fn is_root(self) -> bool {
-        matches!(self, NodeKind::Root)
+        matches!(self, NodeType::Root)
     }
 
     /// Returns whether the node is specifically the Rubbish Bin root.
     pub fn is_rubbish_bin(self) -> bool {
-        matches!(self, NodeKind::Trash)
+        matches!(self, NodeType::Trash)
     }
 
     /// Returns whether the node is specifically the Inbox root.
     pub fn is_inbox(self) -> bool {
-        matches!(self, NodeKind::Inbox)
+        matches!(self, NodeType::Inbox)
+    }
+}
+
+impl Display for NodeType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let as_str = match self {
+            Self::File => "File",
+            Self::Folder => "Folder",
+            Self::Root => "Root",
+            Self::Inbox => "Inbox",
+            Self::Trash => "Trash",
+            Self::Unknown => "Unknown",
+        };
+        write!(f, "{as_str}")
     }
 }
 
@@ -163,11 +178,44 @@ pub enum Request {
     #[serde(rename = "f")]
     FetchNodes {
         /// `c` should be 1.
+        /// meganz/webclient code always supplies `c` with a value of `1i32`:
+        /// https://github.com/meganz/webclient/blob/2403abfaa06dd5616c7d1801e37b16fef0d96979/js/mega.js#L2660
+        /// meganz/sdk also always sets `c` to `1`:
+        /// https://github.com/meganz/sdk/blob/00485164cced1b3133ad49c1d62ea88b92ffb085/src/commands.cpp#L6930
         #[serde(rename = "c")]
         c: i32,
         /// TODO
+        /// meganz/webclient code always supplies `r` with a value of `1i32`:
+        /// https://github.com/meganz/webclient/blob/2403abfaa06dd5616c7d1801e37b16fef0d96979/js/mega.js#L2660
+        /// meganz/sdk also always sets `r` to `1`. Both clients appear to process the response as
+        /// a stream, which may (or may not) be pertenant to it's meaning. See:
+        /// https://github.com/meganz/sdk/blob/00485164cced1b3133ad49c1d62ea88b92ffb085/src/commands.cpp#L6931
         #[serde(rename = "r", skip_serializing_if = "Option::is_none")]
         r: Option<i32>,
+        /// TODO
+        ///
+        /// meganz/webclient code suggests that `ca`, when set to `1i32` allows something called "treecache" usage:
+        /// https://github.com/meganz/webclient/blob/2403abfaa06dd5616c7d1801e37b16fef0d96979/js/mega.js#L2678-L2680
+        ///
+        /// The meganz/sdk code confirms this interpretation, setting `ca` to `1` unless no caching
+        /// is specified as a parameter:
+        /// https://github.com/meganz/sdk/blob/00485164cced1b3133ad49c1d62ea88b92ffb085/src/commands.cpp#L6933-L6936
+        #[serde(rename = "ca", skip_serializing_if = "Option::is_none")]
+        cache: Option<i32>,
+
+        /// Unknown function. However it's apparently "the only arg supported by [the] VPN [client]".
+        ///
+        /// https://github.com/meganz/sdk/blob/00485164cced1b3133ad49c1d62ea88b92ffb085/src/commands.cpp#L6924-L6928
+        #[serde(rename = "mc", skip_serializing_if = "Option::is_none")]
+        mc: Option<i32>,
+
+        /// Unknown function. Something to do with "partial fetching". The sdk reference code sets
+        /// this to `1` in conjunction with the `n` argument when operating as a Password Manager
+        /// client.
+        ///
+        /// https://github.com/meganz/sdk/blob/00485164cced1b3133ad49c1d62ea88b92ffb085/src/commands.cpp#L6941
+        #[serde(rename = "part", skip_serializing_if = "Option::is_none")]
+        part: Option<i32>,
     },
     /// Message for initiating the download of a node.
     #[serde(rename = "g")]
@@ -491,28 +539,59 @@ pub struct FileUser {
 /// Represents a node in MEGA.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FileNode {
+    /// Type (file, folder, ...)
     #[serde(rename = "t")]
-    pub kind: NodeKind,
+    pub r#type: NodeType,
+
+    /// attributes (such as file/folder name)
     #[serde(rename = "a")]
-    pub attr: String,
+    pub attributes: String,
+
+    /// File attributes (if file node)
     #[serde(rename = "fa")]
-    pub file_attr: Option<String>,
+    pub file_attributes: Option<String>,
+
+    /// File size (if file node)
+    #[serde(rename = "s")]
+    pub file_size: Option<u64>,
+
+
+    /// Handle 
     #[serde(rename = "h")]
     pub handle: String,
+
+    /// Parent handle (if any)
     #[serde(rename = "p")]
-    pub parent: String,
+    pub parent_handle: String,
+
     #[serde(rename = "ts")]
-    pub ts: i64,
+    pub actual_creation_timestamp: i64,
+
     #[serde(rename = "u")]
-    pub user: String,
+    pub owner_user_handle: String,
+
+    /// key(s)
     #[serde(rename = "k")]
     pub key: Option<String>,
-    #[serde(rename = "su")]
-    pub s_user: Option<String>,
+
+    // #[serde(rename = "s")]
+    // pub related_source_new_node_index: Option<i64>,
+
+    /// Access level of an inbound share
+    #[serde(rename = "r")]
+    pub share_access_level: Option<i64>,
+
+    /// Share key of an inbound share
     #[serde(rename = "sk")]
-    pub s_key: Option<String>,
-    #[serde(rename = "s")]
-    pub sz: Option<u64>,
+    pub share_key: Option<String>,
+
+    /// User handle of an inbound share
+    #[serde(rename = "su")]
+    pub share_user_handle: Option<String>,
+   
+    /// timestamp of an inbound share
+    #[serde(rename = "sts")]
+    pub share_timestamp: Option<i64>,
 }
 
 /// Response for the `Request::FetchNodes` message.
@@ -565,7 +644,7 @@ pub struct UploadResponse {
 pub struct UploadAttributes {
     /// The kind of the uploaded node.
     #[serde(rename = "t")]
-    pub kind: NodeKind,
+    pub kind: NodeType,
     /// The attributes for the uploaded node.
     #[serde(rename = "a")]
     pub attr: String,

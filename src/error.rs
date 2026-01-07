@@ -1,12 +1,16 @@
+use std::sync::Arc;
+
 use serde_repr::{Deserialize_repr, Serialize_repr};
 use thiserror::Error;
+
+use crate::NodeType;
 
 /// The `Result` type for this library.
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// The main error type for this library.
 #[non_exhaustive]
-#[derive(Debug, Error)]
+#[derive(Debug, Error, Clone)]
 pub enum Error {
     /// Missing user session.
     #[error("missing user session (consider logging in first)")]
@@ -62,6 +66,20 @@ pub enum Error {
     /// Failed to find node attribute.
     #[error("failed to find node attribute")]
     NodeAttributeNotFound,
+    #[error("node could not be decrypted due to invalid type: `{r#type}`")]
+    NodeDecryptionFailureInvalidType {
+        r#type: NodeType,
+    },
+    #[error("could not decrypt node data due to unsupported file key type")]
+    NodeDecryptionFailureUnsupportedFileKey,
+    #[error(r#"could not decrypt node data due to attributes failing decryption from "base64 URL safe no pad""#)]
+    NodeDecryptionFailureUndecodableAttributes,
+    #[error(r#"could not decrypt node data due to failure to decrypt and unpack attributes"#)]
+    NodeDecryptionFailureFailedToUnpackAttributes,
+    #[error(r#"decryption of a node attempted without it's encryption context"#)]
+    NodeDecryptionFailureNoDecryptionContext,
+    #[error(r#"could not decrypt node data as the encrypted data was missing"#)]
+    NodeDecryptionFailureMissingEncryptedData,
     /// Could not get a meaningful response after maximum retries.
     #[error("could not get a meaningful response after maximum retries")]
     MaxRetriesReached,
@@ -87,8 +105,7 @@ pub enum Error {
     #[error("`reqwest` error: {source}")]
     ReqwestError {
         /// The source `reqwest` error.
-        #[from]
-        source: reqwest::Error,
+        source: Arc<reqwest::Error>,
     },
     /// URL parse error.
     #[error("URL parse error: {source}")]
@@ -101,8 +118,7 @@ pub enum Error {
     #[error("JSON error: {source}")]
     JsonError {
         /// The source `serde_json` error.
-        #[from]
-        source: json::Error,
+        source: Arc<json::Error>,
     },
     /// Base64 encode error.
     #[error("base64 encode error: {source}")]
@@ -157,16 +173,32 @@ pub enum Error {
     #[error("IO error: {source}")]
     IoError {
         /// The source `std::io` error.
-        #[from]
-        source: std::io::Error,
+        source: Arc<std::io::Error>,
     },
     /// Other errors.
     #[error("other error: {source}")]
     Other {
         /// The source error.
-        #[from]
-        source: Box<dyn std::error::Error + Send + Sync>,
+        source: Arc<dyn std::error::Error + Send + Sync>,
     },
+}
+
+impl From<std::io::Error> for Error {
+    fn from(value: std::io::Error) -> Self {
+        Self::IoError { source: Arc::new(value) }
+    }
+}
+
+impl From<json::Error> for Error {
+    fn from(value: json::Error) -> Self {
+        Self::JsonError { source: Arc::new(value) }
+    }
+}
+
+impl From<reqwest::Error> for Error {
+    fn from(value: reqwest::Error) -> Self {
+        Self::ReqwestError { source: Arc::new(value) }
+    }
 }
 
 /// Error code originating from MEGA's API.

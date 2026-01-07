@@ -132,7 +132,7 @@ pub(crate) fn extract_share_keys(
     session: &UserSession,
     attr: &UserAttributesResponse,
 ) -> Result<HashMap<String, Vec<u8>>> {
-    let hkdf = Hkdf::<Sha256>::new(None, &session.key);
+    let hkdf = Hkdf::<Sha256>::new(None, &session.master_key);
     let mut derived_key = [0u8; 16];
     hkdf.expand(&[1], &mut derived_key)?;
 

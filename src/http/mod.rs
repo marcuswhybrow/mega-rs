@@ -1,16 +1,18 @@
+use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::io::AsyncRead;
-use secrecy::SecretBox;
+use secrecy::{SecretBox, SecretSlice, SecretString};
 use url::Url;
 use zeroize::Zeroize;
 
 #[cfg(feature = "reqwest")]
 mod reqwest;
 
+use crate::DecryptionContext;
 use crate::error::Result;
 use crate::protocol::commands::{Request, Response};
 use crate::utils::rsa::RsaPrivateKey;
@@ -19,15 +21,41 @@ use crate::utils::rsa::RsaPrivateKey;
 #[derive(Debug, Clone, Zeroize)]
 pub struct UserSession {
     /// The user's session id.
-    pub(crate) sid: String,
+    pub(crate) session_id: String,
     /// The user's master key.
-    pub(crate) key: [u8; 16],
+    pub(crate) master_key: [u8; 16],
     /// The user's `sek`.
     pub(crate) sek: [u8; 16],
     /// The user's RSA private key (used for shares).
-    pub(crate) privk: RsaPrivateKey,
+    pub(crate) private_key: RsaPrivateKey,
     /// The user's handle.
     pub(crate) user_handle: String,
+    /// Cached share keys for decrypting nodes from inbound shares
+    pub(crate) share_keys: Option<Vec<ShareKey>>,
+}
+
+impl UserSession {
+    pub(crate) fn decryption_context(&self, share_keys: HashMap<String, Vec<u8>>, node_key: Option<Vec<u8>>) -> DecryptionContext {
+        DecryptionContext {
+            user_handle: SecretString::from(self.user_handle.clone()),
+            user_master_key: SecretBox::new(Box::new(self.master_key.clone())),
+            user_private_key: SecretBox::new(Box::new(self.private_key.clone())),
+            node_key: node_key
+                .clone()
+                .map(|node_key| String::from_utf8(node_key).unwrap().into()),
+            share_keys: share_keys
+                .into_iter()
+                .map(|(key, val)| (key, SecretSlice::from(val)))
+                .collect(),
+        }
+    }
+}
+
+
+#[derive(Debug, Clone, Zeroize)]
+pub struct ShareKey {
+    pub(crate) handle: String,
+    pub(crate) key: Vec<u8>,
 }
 
 /// Stores the data representing the client's state.
