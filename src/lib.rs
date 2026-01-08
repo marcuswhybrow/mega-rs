@@ -15,6 +15,7 @@ use hmac::{Hmac, Mac};
 use pbkdf2::pbkdf2_hmac_array;
 use rustc_hash::FxHashMap;
 use secrecy::{ExposeSecret, SecretBox, SecretSlice, SecretString};
+use serde::{Deserialize, Serialize};
 use sha2::{Sha256, Sha512};
 use static_assertions::assert_impl_all;
 use tracing::instrument;
@@ -2148,7 +2149,7 @@ impl EventBatch {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
 pub struct Node {
     /// The handle of the node.
     pub(crate) handle: String,
@@ -2174,7 +2175,7 @@ pub struct Node {
     pub(crate) decrypted_data: NodeDecryptedData,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
 pub struct NodeDecryptedData {
     /// The name of the node.
     pub(crate) name: String,
@@ -2437,7 +2438,7 @@ pub struct DecryptionContext {
 }
 
 /// Represents a collection of nodes from MEGA.
-#[derive(Debug)]
+#[derive(Serialize, Deserialize)]
 pub struct Nodes {
     /// The nodes from MEGA, keyed by their handle.
     pub(crate) nodes: FxHashMap<String, Node>,

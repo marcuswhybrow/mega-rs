@@ -28,7 +28,7 @@ thiserror = "1.0.64"
 # Miscellaneous
 url = "2.5.2"
 rand = "0.8.5"
-chrono = "0.4.38"
+chrono = { version = "0.4.38", features = ["serde"] }
 static_assertions = "1.1.0"
 zeroize = { version = "1.8.1", features = ["derive"] }
 
