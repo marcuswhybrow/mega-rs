@@ -70,6 +70,8 @@ pub enum Error {
     NodeDecryptionFailureInvalidType {
         r#type: NodeType,
     },
+    #[error("could not decrypt node as file key was missing in server response")]
+    NodeDecryptionFailureMissingFileKey,
     #[error("could not decrypt node data due to unsupported file key type")]
     NodeDecryptionFailureUnsupportedFileKey,
     #[error(r#"could not decrypt node data due to attributes failing decryption from "base64 URL safe no pad""#)]

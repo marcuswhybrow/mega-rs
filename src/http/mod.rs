@@ -12,9 +12,9 @@ use zeroize::Zeroize;
 #[cfg(feature = "reqwest")]
 mod reqwest;
 
-use crate::DecryptionContext;
+use crate::{DecryptionContext, utils};
 use crate::error::Result;
-use crate::protocol::commands::{Request, Response};
+use crate::protocol::commands::{Request, Response, UserAttributesResponse};
 use crate::utils::rsa::RsaPrivateKey;
 
 /// Stores the data representing a user's session.
@@ -35,8 +35,22 @@ pub struct UserSession {
 }
 
 impl UserSession {
-    pub(crate) fn decryption_context(&self, share_keys: HashMap<String, Vec<u8>>, node_key: Option<Vec<u8>>) -> DecryptionContext {
-        DecryptionContext {
+    pub(crate) fn decryption_context(&self, user_attributes: Option<&UserAttributesResponse>, node_key: Option<Vec<u8>>) -> Result<DecryptionContext> {
+        let share_keys = match user_attributes {
+            Some(user_attributes) =>utils::extract_share_keys(self, user_attributes)?,
+            None => HashMap::default(),
+        };
+
+        // This method of getting share keys seems to be unneeded.
+        // (maybe an earlier implementation that got decommissionned/deprecated ?).
+        //
+        // for share in files.ok.iter().flatten() {
+        //     let mut share_key = BASE64_URL_SAFE_NO_PAD.decode(&share.key)?;
+        //     utils::decrypt_ebc_in_place(&session.key, &mut share_key);
+        //     share_keys.insert(share.handle.clone(), share_key);
+        // }
+
+        Ok(DecryptionContext {
             user_handle: SecretString::from(self.user_handle.clone()),
             user_master_key: SecretBox::new(Box::new(self.master_key.clone())),
             user_private_key: SecretBox::new(Box::new(self.private_key.clone())),
@@ -47,7 +61,7 @@ impl UserSession {
                 .into_iter()
                 .map(|(key, val)| (key, SecretSlice::from(val)))
                 .collect(),
-        }
+        })
     }
 }
 
