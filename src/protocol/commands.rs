@@ -594,6 +594,44 @@ pub struct FileNode {
     pub share_timestamp: Option<i64>,
 }
 
+impl FileNode {
+    pub(crate) fn extract_attachements(&self) -> FileNodeAttachments {
+        let mut thumbnail_handle = None;
+        let mut preview_image_handle = None;
+
+        if let Some(file_attributes) = &self.file_attributes {
+
+            // format: {bundle_id}:{attr_type}*{attr_handle}
+            let attrs = file_attributes
+                .split('/')
+                .filter_map(|it| it.split_once(':')?.1.split_once('*'));
+
+            for (kind, handle) in attrs {
+                match kind {
+                    "0" => {
+                        thumbnail_handle = Some(handle.to_string());
+                    }
+                    "1" => {
+                        preview_image_handle = Some(handle.to_string());
+                    }
+                    _ => continue,
+                }
+            }
+        }
+
+        FileNodeAttachments {
+            thumbnail_handle,
+            preview_image_handle
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct FileNodeAttachments {
+    pub(crate) thumbnail_handle: Option<String>,
+    pub(crate) preview_image_handle: Option<String>,
+}
+
 /// Response for the `Request::FetchNodes` message.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FetchNodesResponse {

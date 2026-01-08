@@ -37,7 +37,7 @@ pub use crate::utils::StorageQuotas;
 use crate::attributes::NodeAttributes;
 use crate::fingerprint::NodeFingerprint;
 use crate::http::{ClientState, HttpClient, UserSession};
-use crate::protocol::commands::{Request, Response, UploadAttributes};
+use crate::protocol::commands::{FileNodeAttachments, Request, Response, UploadAttributes};
 use crate::protocol::events::{EventBatchResponse, EventResponse, EventResponseKind};
 use crate::protocol::{FILE_KEY_SIZE, FOLDER_KEY_SIZE, USER_KEY_SIZE, USER_SID_SIZE};
 use crate::utils::rsa::RsaPrivateKey;
@@ -605,141 +605,28 @@ impl Client {
 
             match file.r#type {
                 NodeType::File | NodeType::Folder => {
-                    tracing::trace!("processing file or folder");
-                    // if let Some((_, s_key)) = file.s_user.as_deref().zip(file.s_key.as_deref()) {
-                    //     let mut share_key = BASE64_URL_SAFE_NO_PAD.decode(s_key)?;
-                    //     utils::decrypt_ebc_in_place(&session.key, &mut share_key);
-                    //     utils::decrypt_ebc_in_place(&share_key, &mut file_key);
-                    //     share_keys.insert(file.handle.clone(), share_key.clone());
-                    // }
-                    
-                    let Some(file_key) = file.key.clone() else {
+                    let Some(node) = Node::new_from_file_encrypted(file, files.clone(), decryption_context.clone()) else {
                         continue;
                     };
-
-                    tracing::trace!("calculating children");
-
-                    // let children = nodes
-                    //     .values()
-                    //     .filter_map(|node| {
-                    //         let parent_handle = node.parent_handle()?;
-                    //         if parent_handle == &file.handle {
-                    //             Some(file.handle.clone())
-                    //         } else {
-                    //             None
-                    //         }
-                    //     })
-                    //     .collect();
-
-                    tracing::trace!("instantiating Node");
-
-                    let node = Node {
-                        files: files.clone(),
-                        handle: file.handle.clone(),
-                        owner_user_handle: file.owner_user_handle.clone(),
-                        file_size: file.file_size.unwrap_or(0),
-                        r#type: file.r#type,
-                        parent_handle: (!file.parent_handle.is_empty()).then(|| file.parent_handle.clone()),
-                        children: OnceLock::new(),
-                        created_at: Some(Utc.timestamp_opt(file.actual_creation_timestamp, 0).unwrap()),
-                        download_id: None,
-                        thumbnail_handle,
-                        preview_image_handle,
-                        decryption_context: Some(decryption_context.clone()),
-                        encrypted_data: Some(NodeEncrypedData {
-                            file_key,
-                            attributes: file.attributes.clone(),
-                        }),
-                        decrypted_data: OnceLock::new(),
-                    };
-
-                    tracing::trace!("inserting into parent");
-
-                    // if let Some(parent) = nodes.get_mut(&file.parent_handle) {
-                    //     parent.children.push(node.handle.clone());
-                    // }
-
-                    tracing::trace!("inserting into Nodes");
-
                     nodes.insert(node.handle.clone(), node);
                 }
                 NodeType::Root => {
-                    let node = Node {
-                        files: files.clone(),
-                        handle: file.handle.clone(),
-                        owner_user_handle: file.owner_user_handle.clone(),
-                        file_size: file.file_size.unwrap_or(0),
-                        r#type: NodeType::Root,
-                        parent_handle: None,
-                        children: OnceLock::new(),
-                        created_at: Some(Utc.timestamp_opt(file.actual_creation_timestamp, 0).unwrap()),
-                        download_id: None,
-                        thumbnail_handle,
-                        preview_image_handle,
-                        decryption_context: None,
-                        encrypted_data: None,
-                        decrypted_data: OnceLock::from(Ok(NodeDecryptedData {
-                            name: String::from("Root"),
-                            aes_key: <_>::default(),
-                            aes_iv: None,
-                            condensed_mac: None,
-                            sparse_checksum: None,
-                            modified_at: None,
-                        })),
-                    };
-                    nodes.insert(node.handle.clone(), node);
+                    nodes.insert(
+                        file.handle.clone(), 
+                        Node::new_from_file_decrypted(file, files.clone(), file.r#type),
+                    );
                 }
                 NodeType::Inbox => {
-                    let node = Node {
-                        files: files.clone(),
-                        handle: file.handle.clone(),
-                        owner_user_handle: file.owner_user_handle.clone(),
-                        file_size: file.file_size.unwrap_or(0),
-                        r#type: NodeType::Inbox,
-                        parent_handle: None,
-                        children: OnceLock::new(),
-                        created_at: Some(Utc.timestamp_opt(file.actual_creation_timestamp, 0).unwrap()),
-                        download_id: None,
-                        thumbnail_handle,
-                        preview_image_handle,
-                        decryption_context: None,
-                        encrypted_data: None,
-                        decrypted_data: OnceLock::from(Ok(NodeDecryptedData {
-                            name: String::from("Inbox"),
-                            aes_key: <_>::default(),
-                            aes_iv: None,
-                            condensed_mac: None,
-                            sparse_checksum: None,
-                            modified_at: None,
-                        })),
-                    };
-                    nodes.insert(node.handle.clone(), node);
+                    nodes.insert(
+                        file.handle.clone(), 
+                        Node::new_from_file_decrypted(file, files.clone(), file.r#type),
+                    );
                 }
                 NodeType::Trash => {
-                    let node = Node {
-                        files: files.clone(),
-                        handle: file.handle.clone(),
-                        owner_user_handle: file.owner_user_handle.clone(),
-                        file_size: file.file_size.unwrap_or(0),
-                        r#type: NodeType::Trash,
-                        parent_handle: None,
-                        children: OnceLock::new(),
-                        created_at: Some(Utc.timestamp_opt(file.actual_creation_timestamp, 0).unwrap()),
-                        download_id: None,
-                        thumbnail_handle,
-                        preview_image_handle,
-                        decryption_context: None,
-                        encrypted_data: None,
-                        decrypted_data: OnceLock::from(Ok(NodeDecryptedData {
-                            name: String::from("Trash"),
-                            aes_key: <_>::default(),
-                            aes_iv: None,
-                            condensed_mac: None,
-                            sparse_checksum: None,
-                            modified_at: None,
-                        })),
-                    };
-                    nodes.insert(node.handle.clone(), node);
+                    nodes.insert(
+                        file.handle.clone(), 
+                        Node::new_from_file_decrypted(file, files.clone(), file.r#type),
+                    );
                 }
                 NodeType::Unknown => {
                     continue;
@@ -881,7 +768,6 @@ impl Client {
                 Ok(Nodes::new(nodes, String::default(), Some(node_id.to_string())))
             }
             NodeType::Folder => {
-
                 let request = Request::FetchNodes { 
                     c: 1, 
                     r: Some(1),
@@ -917,30 +803,9 @@ impl Client {
 
                     match file.r#type {
                         NodeType::File | NodeType::Folder => {
-                            let Some(file_key) = file.key.clone() else {
+                            let Some(node) = Node::new_from_file_encrypted(file, files.clone(), decryption_context.clone()) else {
                                 continue;
                             };
-
-                            let node = Node {
-                                files: files.clone(),
-                                handle: file.handle.clone(),
-                                owner_user_handle: file.owner_user_handle.clone(),
-                                file_size: file.file_size.unwrap_or(0),
-                                r#type: file.r#type,
-                                parent_handle: (!file.parent_handle.is_empty()).then(|| file.parent_handle.clone()),
-                                children: OnceLock::new(),
-                                created_at: Some(Utc.timestamp_opt(file.actual_creation_timestamp, 0).unwrap()),
-                                download_id: Some(node_id.to_string()),
-                                thumbnail_handle,
-                                preview_image_handle,
-                                decryption_context: Some(decryption_context.clone()),
-                                encrypted_data: Some(NodeEncrypedData { 
-                                    file_key,
-                                    attributes: file.attributes.clone(),
-                                }),
-                                decrypted_data: OnceLock::new(),
-                            };
-
                             nodes.insert(node.handle.clone(), node);
                         }
                         _ => unreachable!(),
@@ -2371,6 +2236,61 @@ impl NodeDecryptedData {
 }
 
 impl Node {
+    pub(crate) fn new_from_file_decrypted(file: &FileNode, files: Arc<Vec<FileNode>>, r#type: NodeType) -> Self {
+        let attachments = file.extract_attachements();
+        Self {
+            files,
+            handle: file.handle.clone(),
+            owner_user_handle: file.owner_user_handle.clone(),
+            file_size: file.file_size.unwrap_or(0),
+            r#type,
+            parent_handle: None,
+            children: OnceLock::new(),
+            created_at: Some(Utc.timestamp_opt(file.actual_creation_timestamp, 0).unwrap()),
+            download_id: None,
+            thumbnail_handle: attachments.thumbnail_handle,
+            preview_image_handle: attachments.preview_image_handle,
+            decryption_context: None,
+            encrypted_data: None,
+            decrypted_data: OnceLock::from(Ok(NodeDecryptedData {
+                name: match r#type {
+                    NodeType::Root => "Root",
+                    NodeType::Inbox => "Inbox",
+                    NodeType::Trash => "Trash",
+                    _ => panic!("Only Root, Inbox & Trash node types can be instantiated in a decrypted state"),
+                }.to_string(),
+                aes_key: <_>::default(),
+                aes_iv: None,
+                condensed_mac: None,
+                sparse_checksum: None,
+                modified_at: None,
+            })),
+        }
+    }
+
+    pub(crate) fn new_from_file_encrypted(file: &FileNode, files: Arc<Vec<FileNode>>, decryption_context: Arc<DecryptionContext>) -> Option<Self> {
+        let attachments = file.extract_attachements();
+        Some(Node {
+            files: files.clone(),
+            handle: file.handle.clone(),
+            owner_user_handle: file.owner_user_handle.clone(),
+            file_size: file.file_size.unwrap_or(0),
+            r#type: file.r#type,
+            parent_handle: (!file.parent_handle.is_empty()).then(|| file.parent_handle.clone()),
+            children: OnceLock::new(),
+            created_at: Some(Utc.timestamp_opt(file.actual_creation_timestamp, 0).unwrap()),
+            download_id: None,
+            thumbnail_handle: attachments.thumbnail_handle,
+            preview_image_handle: attachments.preview_image_handle,
+            decryption_context: Some(decryption_context.clone()),
+            encrypted_data: Some(NodeEncrypedData {
+                file_key: file.key.clone()?,
+                attributes: file.attributes.clone(),
+            }),
+            decrypted_data: OnceLock::new(),
+        })
+    }
+
     pub(crate) fn aes_key(&self) -> Result<&[u8; 16]> {
         Ok(&self.decrypted_data()?.aes_key)
     }
